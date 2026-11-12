@@ -24,8 +24,12 @@ export interface BackpressureAuditEvent {
   ts: string;
   queue: string;
   name: string;
-  waiting_count: number;
-  max_waiting: number;
+  /** Present on maxWaiting (rate-cap) coalesce events. */
+  waiting_count?: number;
+  max_waiting?: number;
+  /** Present on maxPending (single-flight) coalesce events. */
+  pending_count?: number;
+  max_pending?: number;
   decision: 'coalesced';
   returned_job_id: number;
 }

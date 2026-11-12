@@ -85,6 +85,15 @@ export interface MinionJob {
   error_text: string | null;
   stacktrace: string[];
 
+  /**
+   * Submission metadata, NOT a DB column: set only by MinionQueue.add()
+   * when it returned an EXISTING row instead of inserting (idempotency
+   * fast-path, backpressure cap-hit, or the ON CONFLICT zero-row fallback).
+   * rowToMinionJob never sets it; absent on fresh inserts and on rows read
+   * back later. Lets a submitter tell a real dispatch from a coalesce.
+   */
+  coalesced?: boolean;
+
   // Timestamps
   created_at: Date;
   started_at: Date | null;
@@ -130,6 +139,24 @@ export interface MinionJobInput {
   idempotency_key?: string;
   /** Submission backpressure: cap waiting jobs with this name before inserting a new row. */
   maxWaiting?: number;
+  /**
+   * Submission single-flight: cap PENDING jobs — waiting rows plus LIVE-LOCK
+   * active rows (status='active' AND lock_until > now()) — for this
+   * (name, queue, source) scope before inserting a new row. Expired-lock
+   * actives belong to a dead/blocked worker and never count, so a wedged
+   * worker cannot suppress dispatch (new waiting rows keep feeding the
+   * waitingClaimable>0 wedge detectors); dead/cancelled/completed never
+   * count either. Cap-hit returns the most-recent waiting row, else the
+   * most-recent live-lock active row, stamped `coalesced: true`. Scope is
+   * EXACT (unlike maxWaiting): COALESCE(data.sourceId, data.source_id)
+   * compared with IS NOT DISTINCT FROM — a NULL-source submission matches
+   * only NULL-source rows, never a wildcard. If both maxPending and
+   * maxWaiting are supplied, both guards apply; maxPending is checked
+   * first. Internal option (autopilot dispatch single-flight); not exposed
+   * as a public submit flag yet — semantics exclude delayed/paused/
+   * waiting-children rows deliberately.
+   */
+  maxPending?: number;
 
   // v12: scheduler polish
   /**

@@ -52,8 +52,15 @@ export interface FanoutOpts {
 }
 
 export interface FanoutResult {
-  /** Source ids dispatched this tick. */
+  /** Source ids dispatched this tick (a fresh job row was INSERTED). */
   dispatched: string[];
+  /**
+   * Source ids whose submission coalesced onto an existing pending job
+   * (maxPending single-flight or same-slot idempotency) — work is in
+   * flight, but no new row was created. Kept separate so no surface
+   * claims a dispatch that didn't insert.
+   */
+  coalesced: string[];
   /** Source ids skipped because their last_full_cycle_at is still fresh. */
   skipped_fresh: string[];
   /** Source ids beyond the fanoutMax cap (will retry next tick). */
@@ -182,23 +189,36 @@ export async function dispatchPerSource(
       { repoPath: opts.repoPath },
       {
         queue: 'default',
+        // Slot key dedups repeats within one slot; maxPending: 1 is the
+        // cross-slot guard — an in-flight (waiting or live-lock active)
+        // cycle suppresses re-dispatch even after the slot rotates. This
+        // closes the unbounded-duplicate loop: slot rotation used to mint
+        // a fresh key every baseInterval while maxWaiting ignored the
+        // active row, growing the queue forever when a cycle stalled.
         idempotency_key: `autopilot-cycle:${opts.slot}`,
         max_attempts: 2,
         timeout_ms: opts.timeoutMs,
-        maxWaiting: 1,
+        maxPending: 1,
       },
     );
-    if (opts.jsonMode) {
+    if (job.coalesced) {
+      if (opts.jsonMode) {
+        emit(JSON.stringify({ event: 'dispatch_coalesced', job_id: job.id, mode: 'legacy', slot: opts.slot }));
+      } else {
+        log(`[dispatch] coalesced onto job #${job.id} autopilot-cycle (legacy single-source; already in flight)`);
+      }
+    } else if (opts.jsonMode) {
       emit(JSON.stringify({ event: 'dispatched', job_id: job.id, mode: 'legacy', slot: opts.slot }));
     } else {
       log(`[dispatch] job #${job.id} autopilot-cycle (legacy single-source)`);
     }
-    return { dispatched: [], skipped_fresh: [], skipped_cap: [], legacy_fallback: true };
+    return { dispatched: [], coalesced: [], skipped_fresh: [], skipped_cap: [], legacy_fallback: true };
   }
 
   const { dispatch, skippedFresh, skippedCap } = selectSourcesForDispatch(sources, opts.fanoutMax);
 
   const dispatched: string[] = [];
+  const coalesced: string[] = [];
   for (const src of dispatch) {
     try {
       const remoteUrl = typeof src.config?.remote_url === 'string' ? src.config.remote_url : null;
@@ -216,26 +236,50 @@ export async function dispatchPerSource(
           idempotency_key: `autopilot-cycle:${src.id}:${opts.slot}`,
           max_attempts: 2,
           timeout_ms: opts.timeoutMs,
-          // DELIBERATELY no maxWaiting: 1 here. maxWaiting is per
-          // (name, queue), so it would coalesce all N per-source jobs
-          // sharing name='autopilot-cycle' down to ONE waiting job —
-          // killing the fan-out. The per-source idempotency_key
-          // already provides the right dedup granularity (one job per
-          // source per slot, regardless of how many ticks try).
+          // Still DELIBERATELY no maxWaiting here (its NULL-as-wildcard
+          // source scope would coalesce N per-source jobs down to one).
+          // maxPending is safe: its scope is EXACT on
+          // COALESCE(data.sourceId, data.source_id), so each source keeps
+          // an independent single-flight cap — and unlike the slot key, it
+          // suppresses cross-slot re-dispatch while THIS source's cycle is
+          // still in flight (waiting or live-lock active).
+          //
+          // This is the fix for the redundant-queued-dispatch defect: the
+          // slot key rotates every baseInterval, but a real cycle takes
+          // ~565-571s (> the 300s interval), so each tick minted a FRESH
+          // key while the previous cycle was still running. The key alone
+          // cannot dedup across that boundary; maxPending: 1 can, because it
+          // counts the in-flight row.
+          maxPending: 1,
         },
       );
-      dispatched.push(src.id);
-      if (opts.jsonMode) {
-        emit(JSON.stringify({
-          event: 'dispatched',
-          job_id: job.id,
-          mode: 'per_source',
-          source_id: src.id,
-          pull: !!remoteUrl,
-          slot: opts.slot,
-        }));
+      if (job.coalesced) {
+        coalesced.push(src.id);
+        if (opts.jsonMode) {
+          emit(JSON.stringify({
+            event: 'dispatch_coalesced',
+            job_id: job.id,
+            mode: 'per_source',
+            source_id: src.id,
+            slot: opts.slot,
+          }));
+        } else {
+          log(`[dispatch] coalesced onto job #${job.id} autopilot-cycle source=${src.id} (already in flight)`);
+        }
       } else {
-        log(`[dispatch] job #${job.id} autopilot-cycle source=${src.id}${remoteUrl ? ' pull=yes' : ''}`);
+        dispatched.push(src.id);
+        if (opts.jsonMode) {
+          emit(JSON.stringify({
+            event: 'dispatched',
+            job_id: job.id,
+            mode: 'per_source',
+            source_id: src.id,
+            pull: !!remoteUrl,
+            slot: opts.slot,
+          }));
+        } else {
+          log(`[dispatch] job #${job.id} autopilot-cycle source=${src.id}${remoteUrl ? ' pull=yes' : ''}`);
+        }
       }
     } catch (e) {
       // Per-source submit failure does NOT abort the tick (codex E1 F1
@@ -263,6 +307,7 @@ export async function dispatchPerSource(
 
   return {
     dispatched,
+    coalesced,
     skipped_fresh: skippedFresh.map(s => s.id),
     skipped_cap: skippedCap.map(s => s.id),
     legacy_fallback: false,
