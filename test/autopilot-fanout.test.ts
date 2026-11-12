@@ -297,6 +297,55 @@ describe('dispatchPerSource — integration with stubbed engine + queue', () => 
     }
   });
 
+  test('per-source submit passes maxPending: 1 (per-source single-flight)', async () => {
+    // The redundant-dispatch fix: the slot idempotency key rotates every
+    // baseInterval, but a real cycle takes ~565-571s (> the 300s interval),
+    // so the key alone cannot dedup across that boundary — each tick minted
+    // a FRESH key while the previous cycle was still running. maxPending: 1
+    // counts the in-flight row, so the next tick coalesces onto it instead
+    // of inserting a duplicate.
+    //
+    // maxPending (not maxWaiting) is safe here precisely because its scope
+    // is EXACT on the source: each source keeps an independent single-flight
+    // cap, so the fan-out survives.
+    const { engine, queue, added, fanoutOpts } = makeStubs([src('a'), src('b'), src('c')]);
+    await dispatchPerSource(engine, queue, fanoutOpts);
+    expect(added.length).toBe(3);
+    for (const job of added) {
+      expect(job.opts.maxPending).toBe(1);
+    }
+  });
+
+  test('legacy fallback submit passes maxPending: 1', async () => {
+    const { engine, queue, added, fanoutOpts } = makeStubs([]);
+    await dispatchPerSource(engine, queue, fanoutOpts);
+    expect(added.length).toBe(1);
+    expect(added[0].opts.maxPending).toBe(1);
+    expect(added[0].opts.maxWaiting).toBeUndefined();
+  });
+
+  test('coalesced submissions are reported separately from dispatched', async () => {
+    // Honest-dispatch contract: a submission that coalesced onto an
+    // existing in-flight row must NOT be counted as a dispatch.
+    const { engine, queue, added, events, fanoutOpts } = makeStubs([src('a'), src('b')]);
+    // Make the stub return `coalesced: true` for the second submit.
+    let call = 0;
+    const stub = queue as unknown as {
+      add: (name: string, data: unknown, addOpts: Record<string, unknown>) => Promise<{ id: number; coalesced?: boolean }>;
+    };
+    const origAdd = stub.add.bind(queue);
+    stub.add = async (name: string, data: unknown, addOpts: Record<string, unknown>) => {
+      const job = await origAdd(name, data, addOpts);
+      call++;
+      return call === 2 ? { ...job, coalesced: true } : job;
+    };
+    const result = await dispatchPerSource(engine, queue, fanoutOpts);
+    expect(result.dispatched.length).toBe(1);
+    expect(result.coalesced.length).toBe(1);
+    expect(result.dispatched).not.toContain(result.coalesced[0]);
+    expect(events.some(e => e.includes('dispatch_coalesced'))).toBe(true);
+  });
+
   test('all-fresh tick dispatches nothing (no jobs added)', async () => {
     const NOW = Date.now();
     const recent = (id: string) =>

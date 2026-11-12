@@ -37,6 +37,7 @@ import { logSelfUpgrade } from '../core/audit/self-upgrade-audit.ts';
 import { detectInstallMethod } from './upgrade.ts';
 import { evaluateQuietHours } from '../core/minions/quiet-hours.ts';
 import { inspectLock } from '../core/db-lock.ts';
+import { resolveAutopilotDispatchTimeoutMs } from './autopilot-timeout.ts';
 
 /**
  * v0.37.7.0 #1162 — classify autopilot reconnect-loop errors.
@@ -632,7 +633,12 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
         const queue = new MinionQueue(engine);
         const slotMs = Math.floor(Date.now() / (baseInterval * 1000)) * baseInterval * 1000;
         const slot = new Date(slotMs).toISOString();
-        const timeoutMs = Math.max(baseInterval * 2 * 1000, 300_000);
+        // #2781: the light-dispatch budget stays interval-derived (sync /
+        // freshness, extract-atoms-drain, targeted small-plan steps) — those
+        // have no handler anchor and are meant to stay short. The FULL-CYCLE
+        // budget is resolved separately below, from the handler anchor, so it
+        // can never be smaller than the anchor the handler was sized for.
+        const timeoutMs = resolveAutopilotDispatchTimeoutMs(baseInterval, false);
 
         // ── v0.40 D17: per-source freshness check ────────────────────
         // Runs first; independent of score gate. Submits a 'sync' job per
@@ -867,20 +873,35 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
           // behavior is preserved.
           const { dispatchPerSource, resolveFanoutMax } = await import('./autopilot-fanout.ts');
           const fanoutMax = await resolveFanoutMax(engine);
+          // #2781: 'autopilot-cycle' carries a 30-min handler anchor
+          // (handler-timeouts.ts) because a full cycle can outlive short
+          // daemon intervals — unlike the lighter interval-derived `timeoutMs`
+          // above. Naming this separately (rather than reusing the outer
+          // `timeoutMs`) avoids the #2781 bug class: the full-cycle stamp
+          // previously reused the outer non-full-cycle budget by shorthand,
+          // silently overriding its own handler anchor with the 600s
+          // interval-derived value and killing long cycles mid-run.
+          const fullCycleTimeoutMs = resolveAutopilotDispatchTimeoutMs(baseInterval, true);
           const result = await dispatchPerSource(engine, queue, {
             repoPath,
             slot,
-            timeoutMs,
+            timeoutMs: fullCycleTimeoutMs,
             fanoutMax,
             jsonMode,
           });
-          if (result.dispatched.length > 0 || result.legacy_fallback) {
+          // Coalesced counts as work-in-flight: before the dispatched/coalesced
+          // split, a coalesced submission advanced this clock via dispatched —
+          // keep that behavior, or an all-coalesced tick (single-flight
+          // suppression) would retake the full-cycle branch every tick and
+          // starve the targeted-plan path for the whole in-flight window.
+          if (result.dispatched.length > 0 || result.coalesced.length > 0 || result.legacy_fallback) {
             lastFullCycleAt = Date.now();
           }
           if (jsonMode) {
             process.stderr.write(JSON.stringify({
               event: 'fanout_summary',
               dispatched: result.dispatched,
+              coalesced: result.coalesced,
               skipped_fresh: result.skipped_fresh,
               skipped_cap: result.skipped_cap,
               legacy_fallback: result.legacy_fallback,
@@ -890,6 +911,7 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
           } else if (!result.legacy_fallback) {
             console.log(
               `[dispatch] fanout: ${result.dispatched.length} dispatched, ` +
+              `${result.coalesced.length > 0 ? ` (${result.coalesced.length} coalesced onto in-flight), ` : ''}` +
               `${result.skipped_fresh.length} fresh, ${result.skipped_cap.length} capped ` +
               `(score=${score}, max=${fanoutMax})`,
             );
@@ -915,7 +937,16 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
                 submitOpts,
                 isProtected ? { allowProtectedSubmit: true } : undefined,
               );
-              if (jsonMode) {
+              // Honest-dispatch contract (same as the fanout paths): a
+              // coalesced submission never claims a dispatch that didn't
+              // insert a row.
+              if (job.coalesced) {
+                if (jsonMode) {
+                  process.stderr.write(JSON.stringify({ event: 'dispatch_coalesced', job_id: job.id, mode: 'targeted', step: step.id, score, plan_size: plan.length }) + '\n');
+                } else {
+                  console.log(`[dispatch] coalesced onto job #${job.id} ${step.job} (targeted: ${step.id}; already in flight)`);
+                }
+              } else if (jsonMode) {
                 process.stderr.write(JSON.stringify({ event: 'dispatched', job_id: job.id, mode: 'targeted', step: step.id, score, plan_size: plan.length }) + '\n');
               } else {
                 console.log(`[dispatch] job #${job.id} ${step.job} (targeted: ${step.id}; score=${score})`);
